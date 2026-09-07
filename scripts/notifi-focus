@@ -95,12 +95,27 @@ switch_client_to_saved_target() {
   fi
 }
 
+focus_hypr_workspace() {
+  [[ "$workspace_id" =~ ^-?[0-9]+$ ]] || return 1
+
+  # Hyprland 0.55 replaced the old dispatcher CLI syntax with Lua.
+  hyprctl dispatch "hl.dsp.focus({ workspace = $workspace_id })" >/dev/null 2>&1 ||
+    hyprctl dispatch workspace "$workspace_id" >/dev/null 2>&1
+}
+
+focus_hypr_window() {
+  [[ "$hypr_window_address" =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+
+  hyprctl dispatch "hl.dsp.focus({ window = 'address:$hypr_window_address' })" >/dev/null 2>&1 ||
+    hyprctl dispatch focuswindow "address:$hypr_window_address" >/dev/null 2>&1
+}
+
 if [[ -n "$workspace_id" ]]; then
-  hyprctl dispatch workspace "$workspace_id" >/dev/null || true
+  focus_hypr_workspace || true
 fi
 
 if hypr_window_exists; then
-  hyprctl dispatch focuswindow "address:$hypr_window_address" >/dev/null || true
+  focus_hypr_window || true
   switch_client_to_saved_target
 else
   select_saved_window
