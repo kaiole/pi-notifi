@@ -1,6 +1,6 @@
 {
   "name": "pi-notifi",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Pi extension that sends focus-aware desktop notifications when pi finishes a task.",
   "keywords": [
     "pi-package",
