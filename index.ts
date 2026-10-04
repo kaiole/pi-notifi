@@ -37,6 +37,8 @@ type NotifiFileEventConfig = Partial<{
 }>;
 
 type TmuxLocation = {
+	socketPath: string;
+	serverPid: number;
 	sessionId: string;
 	windowId: string;
 	paneId: string;
@@ -66,6 +68,8 @@ type NotifiTarget = {
 	id: string;
 	workspaceId?: number;
 	hyprWindowAddress?: string;
+	tmuxSocketPath: string;
+	tmuxServerPid: number;
 	tmuxSessionId: string;
 	tmuxWindowId: string;
 	tmuxPaneId: string;
@@ -144,14 +148,56 @@ const statusBody = (status: TaskStatus): string => {
 	return "Task Failed";
 };
 
+// TMUX ends with ,server-pid,session-id; socket paths may themselves contain commas.
+const tmuxServer = (): Pick<TmuxLocation, "socketPath" | "serverPid"> | undefined => {
+	const value = process.env.TMUX;
+	if (!value) return undefined;
+	const parts = value.split(",");
+	if (parts.length < 3) return undefined;
+	const socketPath = parts.slice(0, -2).join(",");
+	const serverPid = Number(parts.at(-2));
+	if (!socketPath.startsWith("/") || !Number.isInteger(serverPid) || serverPid <= 0) return undefined;
+	return { socketPath, serverPid };
+};
+
+const execTmux = (pi: ExtensionAPI, args: string[], timeout = 2000) => {
+	const server = tmuxServer();
+	if (!server) throw new Error("Cannot identify the originating tmux server");
+	// -N prevents a missing socket from starting a replacement server.
+	return pi.exec("tmux", ["-N", "-S", server.socketPath, ...args], { timeout });
+};
+
+const desktopNotificationsAllowed = async (pi: ExtensionAPI): Promise<boolean> => {
+	if (!process.env.TMUX) {
+		return !env("SSH_CONNECTION") && !env("SSH_TTY") && !env("SSH_CLIENT");
+	}
+
+	try {
+		const server = tmuxServer();
+		if (!server) return false;
+		const identity = await execTmux(pi, ["display-message", "-p", "#{pid}"]);
+		if (identity.code !== 0 || Number(identity.stdout.trim()) !== server.serverPid) return false;
+		const option = await execTmux(pi, ["show-options", "-sqv", "@notifi-desktop"]);
+		if (option.code !== 0) return false;
+		const mode = option.stdout.trim().toLowerCase() || "auto";
+		if (mode === "on") return true;
+		if (mode !== "auto") return false; // off, or an invalid policy: fail closed.
+
+		// Use server-global provenance, not the pi process/session environment,
+		// which can inherit stale SSH variables after a client reattaches.
+		const environment = await execTmux(pi, ["show-environment", "-g"]);
+		return environment.code === 0 && !/^SSH_(?:CONNECTION|TTY|CLIENT)=.+$/m.test(environment.stdout);
+	} catch {
+		return false;
+	}
+};
+
 const getTmuxSessionTitle = async (pi: ExtensionAPI): Promise<string | undefined> => {
 	const pane = process.env.TMUX_PANE;
 	if (!process.env.TMUX || !pane) return undefined;
 
 	try {
-		const result = await pi.exec("tmux", ["display-message", "-p", "-t", pane, "#S:#{window_index}"], {
-			timeout: 2000,
-		});
+		const result = await execTmux(pi, ["display-message", "-p", "-t", pane, "#S:#{window_index}"]);
 		const title = result.stdout.trim();
 		return title || undefined;
 	} catch {
@@ -218,12 +264,12 @@ const getTmuxLocation = async (pi: ExtensionAPI): Promise<TmuxLocation | undefin
 	if (!process.env.TMUX || !pane) return undefined;
 
 	try {
-		const result = await pi.exec("tmux", ["display-message", "-p", "-t", pane, "#{session_id}\t#{window_id}\t#{pane_id}\t#S\t#{window_index}"], {
-			timeout: 2000,
-		});
-		const [sessionId, windowId, paneId, sessionName, windowIndex] = result.stdout.trim().split("\t");
-		if (!sessionId || !windowId || !paneId) return undefined;
-		return { sessionId, windowId, paneId, sessionName, windowIndex };
+		const result = await execTmux(pi, ["display-message", "-p", "-t", pane, "#{socket_path}\t#{pid}\t#{session_id}\t#{window_id}\t#{pane_id}\t#S\t#{window_index}"]);
+		const [socketPath, pidText, sessionId, windowId, paneId, sessionName, windowIndex] = result.stdout.trim().split("\t");
+		const serverPid = Number(pidText);
+		const server = tmuxServer();
+		if (result.code !== 0 || !server || socketPath !== server.socketPath || serverPid !== server.serverPid || !sessionId || !windowId || !paneId) return undefined;
+		return { socketPath, serverPid, sessionId, windowId, paneId, sessionName, windowIndex };
 	} catch {
 		return undefined;
 	}
@@ -231,11 +277,7 @@ const getTmuxLocation = async (pi: ExtensionAPI): Promise<TmuxLocation | undefin
 
 const getTmuxClients = async (pi: ExtensionAPI): Promise<TmuxClient[]> => {
 	try {
-		const result = await pi.exec(
-			"tmux",
-			["list-clients", "-F", "#{client_pid}\t#{client_tty}\t#{session_id}\t#{window_id}"],
-			{ timeout: 2000 },
-		);
+		const result = await execTmux(pi, ["list-clients", "-F", "#{client_pid}\t#{client_tty}\t#{session_id}\t#{window_id}"]);
 
 		return result.stdout
 			.split("\n")
@@ -333,6 +375,8 @@ const getPiTmuxWindowTarget = async (pi: ExtensionAPI, targetId: string): Promis
 
 	const baseTarget: NotifiTarget = {
 		id: targetId,
+		tmuxSocketPath: location.socketPath,
+		tmuxServerPid: location.serverPid,
 		tmuxSessionId: location.sessionId,
 		tmuxWindowId: location.windowId,
 		tmuxPaneId: location.paneId,
@@ -443,16 +487,19 @@ const sendNotification = async (pi: ExtensionAPI, config: NotifiConfig, targetId
 	);
 };
 
-const notify = async (pi: ExtensionAPI, ctx: ExtensionContext, status: TaskStatus) => {
+const notify = async (pi: ExtensionAPI, ctx: ExtensionContext, status: TaskStatus): Promise<boolean> => {
+	if (!(await desktopNotificationsAllowed(pi))) return false;
 	const config = await getConfig(pi, ctx, status);
-	if (config.disabled) return;
-	if (config.focusAware && (await piTmuxWindowIsVisible(pi))) return;
+	if (config.disabled) return false;
+	if (config.focusAware && (await piTmuxWindowIsVisible(pi))) return false;
 
 	try {
 		const targetId = randomUUID();
 		const target = await getPiTmuxWindowTarget(pi, targetId);
+		if (process.env.TMUX && !target) return false;
 		await writeTarget(target);
 		await sendNotification(pi, config, target?.id);
+		return true;
 	} catch (error) {
 		if (ctx.hasUI) {
 			ctx.ui.notify(
@@ -460,6 +507,7 @@ const notify = async (pi: ExtensionAPI, ctx: ExtensionContext, status: TaskStatu
 				"warning",
 			);
 		}
+		return false;
 	}
 };
 
@@ -504,12 +552,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (subcommand === "test") {
-				await notify(pi, ctx, "finished");
-				ctx.ui.notify("notifi test sent", "info");
+				const sent = await notify(pi, ctx, "finished");
+				ctx.ui.notify(sent ? "notifi test sent" : "notifi test not sent (server policy, event config, visibility, or delivery failure)", "info");
 				return;
 			}
 
-			ctx.ui.notify(`notifi is ${state.enabled ? "enabled" : "disabled"}`, "info");
+			const desktopAllowed = await desktopNotificationsAllowed(pi);
+			ctx.ui.notify(`notifi is ${state.enabled ? "enabled" : "disabled"}; desktop delivery ${desktopAllowed ? "allowed" : "blocked"}`, "info");
 		},
 	});
 }

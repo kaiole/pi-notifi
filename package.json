@@ -26,7 +26,8 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit && bash -n scripts/notifi-focus"
+    "test": "node --test tests/*.test.mjs",
+    "check": "tsc --noEmit && bash -n scripts/notifi-focus && npm test"
   },
   "pi": {
     "extensions": [
@@ -39,6 +40,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
     "@types/node": "latest",
+    "jiti": "^2.7.0",
     "typescript": "latest"
   }
 }

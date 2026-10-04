@@ -36,6 +36,8 @@ consume_bad_target() {
 
 workspace_id="$(jq -r '.workspaceId // empty' "$state_file" 2>/dev/null)" || consume_bad_target
 hypr_window_address="$(jq -r '.hyprWindowAddress // empty' "$state_file" 2>/dev/null)" || consume_bad_target
+tmux_socket_path="$(jq -r '.tmuxSocketPath // empty' "$state_file" 2>/dev/null)" || consume_bad_target
+tmux_server_pid="$(jq -r '.tmuxServerPid // empty' "$state_file" 2>/dev/null)" || consume_bad_target
 tmux_session_id="$(jq -r '.tmuxSessionId // empty' "$state_file" 2>/dev/null)" || consume_bad_target
 tmux_window_id="$(jq -r '.tmuxWindowId // empty' "$state_file" 2>/dev/null)" || consume_bad_target
 tmux_pane_id="$(jq -r '.tmuxPaneId // empty' "$state_file" 2>/dev/null)" || consume_bad_target
@@ -44,15 +46,22 @@ tmux_client_tty="$(jq -r '.tmuxClientTty // empty' "$state_file" 2>/dev/null)" |
 rm -f -- "$state_file"
 prune_targets
 
-if [[ -z "$tmux_session_id" || -z "$tmux_window_id" ]]; then
+# Old/unscoped targets cannot safely identify a server. Never guess or use the
+# helper's inherited TMUX environment. Also reject a replacement server at the
+# same socket, whose session/window/pane IDs may have been reused.
+if [[ "$tmux_socket_path" != /* || ! "$tmux_server_pid" =~ ^[1-9][0-9]*$ || -z "$tmux_session_id" || -z "$tmux_window_id" ]]; then
   exit 0
 fi
 
-if ! tmux has-session -t "$tmux_session_id" 2>/dev/null; then
+tmux_cmd=(tmux -N -S "$tmux_socket_path")
+live_server_pid="$("${tmux_cmd[@]}" display-message -p '#{pid}' 2>/dev/null)" || exit 0
+[[ "$live_server_pid" == "$tmux_server_pid" ]] || exit 0
+
+if ! "${tmux_cmd[@]}" has-session -t "$tmux_session_id" 2>/dev/null; then
   exit 0
 fi
 
-if ! tmux list-windows -t "$tmux_session_id" -F '#{window_id}' | grep -Fxq "$tmux_window_id"; then
+if ! "${tmux_cmd[@]}" list-windows -t "$tmux_session_id" -F '#{window_id}' | grep -Fxq "$tmux_window_id"; then
   exit 0
 fi
 
@@ -63,7 +72,7 @@ hypr_window_exists() {
 
 tmux_pane_exists() {
   [[ -n "$tmux_pane_id" ]] || return 1
-  tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "$tmux_pane_id"
+  "${tmux_cmd[@]}" list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "$tmux_pane_id"
 }
 
 saved_tmux_target() {
@@ -76,11 +85,11 @@ saved_tmux_target() {
 
 select_saved_pane() {
   tmux_pane_exists || return 0
-  tmux select-pane -t "$tmux_pane_id" 2>/dev/null || true
+  "${tmux_cmd[@]}" select-pane -t "$tmux_pane_id" 2>/dev/null || true
 }
 
 select_saved_window() {
-  tmux select-window -t "$tmux_session_id:$tmux_window_id" 2>/dev/null || true
+  "${tmux_cmd[@]}" select-window -t "$tmux_session_id:$tmux_window_id" 2>/dev/null || true
   select_saved_pane
 }
 
@@ -89,7 +98,7 @@ switch_client_to_saved_target() {
   target="$(saved_tmux_target)"
 
   if [[ -n "$tmux_client_tty" ]]; then
-    tmux switch-client -c "$tmux_client_tty" -t "$target" 2>/dev/null || select_saved_window
+    "${tmux_cmd[@]}" switch-client -c "$tmux_client_tty" -t "$target" 2>/dev/null || select_saved_window
   else
     select_saved_window
   fi
@@ -119,5 +128,5 @@ if hypr_window_exists; then
   switch_client_to_saved_target
 else
   select_saved_window
-  ghostty -e tmux attach-session -t "$tmux_session_id" >/dev/null 2>&1 &
+  ghostty -e "${tmux_cmd[@]}" attach-session -t "$tmux_session_id" >/dev/null 2>&1 &
 fi
